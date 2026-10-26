@@ -71,6 +71,7 @@ type snapshotCache struct {
 	streamDuration      streamDurationMap
 	deltaStreamDuration streamDurationMap
 	snapshotVersion     int64
+	buildGenerations    map[string]int64
 	lastSnapshot        snapshotMap
 	log                 *zap.SugaredLogger
 	mu                  sync.Mutex
@@ -79,16 +80,30 @@ type snapshotCache struct {
 // GenerateNewSnapshot takes a table of resources (the output from the IR->xDS
 // translator) and updates the snapshot version.
 func (s *snapshotCache) GenerateNewSnapshot(irKey string, resources types.XdsResources, ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	_, span := tracer.Start(ctx, "SnapshotCache.GenerateNewSnapshot")
 	defer span.End()
 
+	// Reserve a generation before building outside the shared lock. A newer
+	// update or deletion for this key must prevent this build from publishing late.
+	s.mu.Lock()
+	version := s.newSnapshotVersion()
+	generation := s.snapshotVersion
+	if s.buildGenerations == nil {
+		s.buildGenerations = make(map[string]int64)
+	}
+	s.buildGenerations[irKey] = generation
+	hashResources := false
+	for streamID := range s.deltaStreamDuration {
+		if node := s.streamIDNodeInfo[streamID]; node != nil && node.Cluster == irKey {
+			hashResources = true
+			break
+		}
+	}
+	s.mu.Unlock()
+
 	sc := trace.SpanContextFromContext(ctx)
-	version := sc.TraceID().String()
-	if !sc.IsValid() {
-		version = s.newSnapshotVersion()
+	if sc.IsValid() {
+		version = sc.TraceID().String()
 	}
 
 	// Create a snapshot with all xDS resources.
@@ -100,11 +115,27 @@ func (s *snapshotCache) GenerateNewSnapshot(irKey string, resources types.XdsRes
 		xdsSnapshotCreateTotal.WithFailure(metrics.ReasonError).Increment()
 		return err
 	}
+	// go-control-plane otherwise hashes delta resources while holding its global
+	// cache lock. Precompute the immutable map so a large gateway's hashing does
+	// not block another key from publishing its snapshot.
+	if hashResources {
+		if err := snapshot.ConstructVersionMap(); err != nil {
+			xdsSnapshotCreateTotal.WithFailure(metrics.ReasonError).Increment()
+			return err
+		}
+	}
 	xdsSnapshotCreateTotal.WithSuccess().Increment()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if current, exists := s.buildGenerations[irKey]; !exists || current != generation {
+		return nil
+	}
 
 	// Delete snapshot from cache if resources are nil
 	if resources == nil {
 		delete(s.lastSnapshot, irKey)
+		delete(s.buildGenerations, irKey)
 	} else {
 		// Update snapshot in cache
 		s.lastSnapshot[irKey] = snapshot

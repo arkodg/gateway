@@ -218,6 +218,18 @@ func (t *Translator) Translate(ctx context.Context, xdsIR *ir.Xds) (*types.Resou
 	if xdsIR == nil {
 		return nil, errors.New("ir is nil")
 	}
+	// Patch processing writes status. Keep those writes local to this translation;
+	// IR values may be shared with other keys or retained by the publisher.
+	if len(xdsIR.EnvoyPatchPolicies) > 0 {
+		local := *xdsIR
+		local.EnvoyPatchPolicies = make([]*ir.EnvoyPatchPolicy, len(xdsIR.EnvoyPatchPolicies))
+		for i, policy := range xdsIR.EnvoyPatchPolicies {
+			copy := *policy
+			copy.Status = policy.Status.DeepCopy()
+			local.EnvoyPatchPolicies[i] = &copy
+		}
+		xdsIR = &local
+	}
 
 	// Record what this translation is about to chew through on the enclosing span, so
 	// that a slow build can be told apart from a build of a bigger input. This covers

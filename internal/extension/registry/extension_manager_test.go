@@ -919,3 +919,42 @@ func TestGetTranslationHookConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestConcurrentXDSHookClientInitialization(t *testing.T) {
+	mgr := &Manager{extension: egv1a1.ExtensionManager{
+		Service: &egv1a1.ExtensionService{BackendEndpoint: egv1a1.BackendEndpoint{
+			IP: &egv1a1.IPEndpoint{Address: "127.0.0.1", Port: 1},
+		}},
+		Hooks: &egv1a1.ExtensionHooks{XDSTranslator: &egv1a1.XDSTranslatorHooks{
+			Pre:  []egv1a1.XDSTranslatorHook{egv1a1.XDSRoute},
+			Post: []egv1a1.XDSTranslatorHook{egv1a1.XDSRoute},
+		}},
+	}}
+	t.Cleanup(mgr.CleanupHookConns)
+	start := make(chan struct{})
+	errors := make(chan error, 16)
+	var workers sync.WaitGroup
+	for index := range 16 {
+		workers.Go(func() {
+			<-start
+			var client extTypes.XDSHookClient
+			var err error
+			if index%2 == 0 {
+				client, err = mgr.GetPreXDSHookClient(egv1a1.XDSRoute)
+			} else {
+				client, err = mgr.GetPostXDSHookClient(egv1a1.XDSRoute)
+			}
+			if err == nil && client == nil {
+				err = fmt.Errorf("missing hook client")
+			}
+			errors <- err
+		})
+	}
+	close(start)
+	workers.Wait()
+	close(errors)
+	for err := range errors {
+		require.NoError(t, err)
+	}
+	require.NotNil(t, mgr.extensionConnCache)
+}

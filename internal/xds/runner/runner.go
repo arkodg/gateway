@@ -32,7 +32,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
-	ktypes "k8s.io/apimachinery/pkg/types"
 
 	egv1a1 "github.com/envoyproxy/gateway/api/v1alpha1"
 	"github.com/envoyproxy/gateway/internal/crypto"
@@ -94,6 +93,7 @@ type Config struct {
 
 type Runner struct {
 	Config
+	cancel context.CancelFunc
 
 	// done tracks goroutines started by Start so that Close can block until
 	// they have all exited, ensuring shared state they write to is not
@@ -166,6 +166,9 @@ func getRandomMaxConnectionAge() time.Duration {
 
 // Close implements Runner interface.
 func (r *Runner) Close() error {
+	if r.cancel != nil {
+		r.cancel()
+	}
 	r.done.Wait()
 	return nil
 }
@@ -239,6 +242,7 @@ func (r *Runner) Start(ctx context.Context) error {
 		)
 	}
 
+	ctx, r.cancel = context.WithCancel(ctx)
 	r.grpc = grpc.NewServer(grpcOpts...)
 	registerServer(serverv3.NewServer(ctx, r.cache, r.cache), r.grpc)
 
@@ -294,10 +298,12 @@ func registerServer(srv serverv3.Server, g *grpc.Server) {
 }
 
 func (r *Runner) translateFromSubscription(sub <-chan watchable.Snapshot[string, *message.XdsIRWithContext]) {
+	statuses := newPatchStatusPublisher(r.ProviderResources, r.XdsIR)
 	// Subscribe to resources
-	message.HandleSubscription(
+	message.HandleSubscriptionWithConcurrency(
 		r.Logger,
 		message.Metadata{Runner: r.Name(), Message: message.XDSIRMessageName}, sub,
+		2,
 		func(update message.Update[string, *message.XdsIRWithContext], errChan chan error) {
 			message.PublishRunnerEventMetric(r.Name(), update.Delete)
 
@@ -326,6 +332,7 @@ func (r *Runner) translateFromSubscription(sub <-chan watchable.Snapshot[string,
 					traceLogger.Error(err, "failed to delete the snapshot")
 					errChan <- err
 				}
+				statuses.publish(key, nil, update.Value.StoredAtTime())
 			} else {
 				// Translate to xds resources
 				proxyInfraName, proxyInfraNamespace := proxyInfraNameAndNamespace(key, r.ControllerNamespace, r.EnvoyGateway.GatewayNamespaceMode())
@@ -401,35 +408,7 @@ func (r *Runner) translateFromSubscription(sub <-chan watchable.Snapshot[string,
 					}
 				}
 
-				// Get all status keys from watchable and save them in the map statusesToDelete.
-				// Iterating through result.EnvoyPatchPolicyStatuses, any valid keys will be removed from statusesToDelete.
-				// Remaining keys will be deleted from watchable before we exit this function.
-				statusesToDelete := make(map[ktypes.NamespacedName]bool)
-				for key := range r.ProviderResources.EnvoyPatchPolicyStatuses.LoadAll() {
-					statusesToDelete[key] = true
-				}
-
-				// Publish EnvoyPatchPolicyStatus
-				for _, e := range result.EnvoyPatchPolicyStatuses {
-					key := ktypes.NamespacedName{
-						Name:      e.Name,
-						Namespace: e.Namespace,
-					}
-					// Skip updating status for policies with empty status
-					// They may have been skipped in this translation because
-					// their target is not found (not relevant)
-					if len(e.Status.Ancestors) > 0 {
-						r.ProviderResources.EnvoyPatchPolicyStatuses.Store(key, e.Status)
-					}
-					delete(statusesToDelete, key)
-				}
-				// Discard the EnvoyPatchPolicyStatuses to reduce memory footprint
-				result.EnvoyPatchPolicyStatuses = nil
-
-				// Delete all the deletable status keys
-				for key := range statusesToDelete {
-					r.ProviderResources.EnvoyPatchPolicyStatuses.Delete(key)
-				}
+				statuses.publish(key, result.EnvoyPatchPolicyStatuses, val.StoredAtTime())
 			}
 		},
 	)

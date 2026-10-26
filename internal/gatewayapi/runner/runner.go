@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -304,82 +305,7 @@ func (r *Runner) subscribeAndTranslate(sub <-chan watchable.Snapshot[string, *re
 
 			rtcTraceCtx, rtcSpan := tracer.Start(traceCtx, "GatewayApiRunner.ResoureTranslationCycle")
 			defer rtcSpan.End()
-			translateGatewayClass := func(resources *resource.Resources) {
-				// The GatewayClass name is deliberately kept out of the span name and passed as
-				// an attribute instead: span names are what most trace backends group/aggregate
-				// by (latency percentiles, error rates, etc.), and this loop runs once per
-				// GatewayClass in the cluster. Baking the name into the span name would fragment
-				// those aggregates into one bucket per class - unbounded and growing over the
-				// cluster's lifetime - for no benefit, since the attribute already makes the span
-				// filterable/searchable by GatewayClass in any trace UI.
-				translateGCCtx, translateGCSpan := tracer.Start(rtcTraceCtx, "GatewayApiRunner.ResoureTranslationCycle.TranslateGatewayClass",
-					trace.WithAttributes(attribute.String("gatewayclass.name", resources.GatewayClass.Name)),
-				)
-				defer translateGCSpan.End()
-				// Translate and publish IRs.
-				t := &gatewayapi.Translator{
-					GatewayControllerName:           r.EnvoyGateway.Gateway.ControllerName,
-					GatewayClassName:                gwapiv1.ObjectName(resources.GatewayClass.Name),
-					GlobalRateLimitEnabled:          r.EnvoyGateway.RateLimit != nil,
-					RateLimitClusterSettings:        r.EnvoyGateway.RateLimit.GetServiceSettings(),
-					EnvoyPatchPolicyEnabled:         r.EnvoyGateway.ExtensionAPIs != nil && r.EnvoyGateway.ExtensionAPIs.EnableEnvoyPatchPolicy,
-					EnvoyProxyPatchDisabled:         !r.EnvoyGateway.RuntimeFlags.IsEnabled(egv1a1.EnvoyProxyPatch),
-					CTPHTTP1ClientScopeOnly:         r.EnvoyGateway.RuntimeFlags.IsEnabled(egv1a1.ApplyClientTrafficPolicyHTTP1SettingsToClientsOnly),
-					OIDCTokenCookieChunkingDisabled: !r.EnvoyGateway.RuntimeFlags.IsEnabled(egv1a1.OIDCTokenCookieChunking),
-					BackendEnabled:                  r.EnvoyGateway.ExtensionAPIs != nil && r.EnvoyGateway.ExtensionAPIs.EnableBackend,
-					ExtensionBackendsEnabled:        r.EnvoyGateway.ExtensionAPIs != nil && r.EnvoyGateway.ExtensionAPIs.EnableExtensionBackends,
-					SDSSecretRefEnabled:             r.EnvoyGateway.ExtensionAPIs != nil && r.EnvoyGateway.ExtensionAPIs.EnableSDSSecretRef,
-					ControllerNamespace:             r.ControllerNamespace,
-					GatewayNamespaceMode:            r.EnvoyGateway.GatewayNamespaceMode(),
-					MergeGateways:                   gatewayapi.IsMergeGatewaysEnabled(resources),
-					MergeBackends:                   gatewayapi.ResolveMergeBackendsConfig(resources),
-					PerResourceSystemCASecret:       r.EnvoyGateway.RuntimeFlags.IsEnabled(egv1a1.PerResourceSystemCASecret),
-					WasmCache:                       r.wasmCache,
-					RunningOnHost:                   r.EnvoyGateway.Provider != nil && r.EnvoyGateway.Provider.IsRunningOnHost(),
-					InfraRemotelyManaged:            r.EnvoyGateway.Provider != nil && r.EnvoyGateway.Provider.IsInfraManagedRemotely(),
-					Logger:                          traceLogger,
-					LuaEnvoyExtensionPolicyDisabled: r.EnvoyGateway.ExtensionAPIs.LuaDisabled(),
-				}
-
-				// If extensions are loaded, pass their supported groups/kinds to the translator
-				if extensions := r.EnvoyGateway.GetExtensionManagers(); len(extensions) > 0 {
-					var extGKs, extSecretGKs []schema.GroupKind
-					for i := range extensions {
-						em := &extensions[i]
-						for _, gvk := range em.Resources {
-							extGKs = append(extGKs, schema.GroupKind{Group: gvk.Group, Kind: gvk.Kind})
-						}
-						// Include backend resources in extension group kinds for custom backend support
-						for _, gvk := range em.BackendResources {
-							extGKs = append(extGKs, schema.GroupKind{Group: gvk.Group, Kind: gvk.Kind})
-						}
-						for _, gvk := range em.SecretResources {
-							extSecretGKs = append(extSecretGKs, schema.GroupKind{Group: gvk.Group, Kind: gvk.Kind})
-						}
-					}
-					t.ExtensionGroupKinds = extGKs
-					t.ExtensionSecretGroupKinds = extSecretGKs
-					traceLogger.Info("extension resources", "GVKs count", len(extGKs))
-				}
-				// Translate to IR.
-				// The span is ended by a deferred call inside the closure: the translator
-				// panics on some inputs and HandleSubscription recovers from it, and an
-				// unended span is never exported, so a plain End() here would drop the
-				// stage span and the input sizes recorded on it. The closure keeps that
-				// defer scoped to this iteration instead of the whole update.
-				result, err := func() (*gatewayapi.TranslateResult, error) {
-					translateToIRCtx, translateToIRSpan := tracer.Start(translateGCCtx, "GatewayApiRunner.ResoureTranslationCycle.TranslateToIR")
-					defer translateToIRSpan.End()
-					return t.Translate(translateToIRCtx, resources)
-				}()
-				if err != nil {
-					// Currently all errors that Translate returns should just be logged
-					traceLogger.Error(err, "errors detected during translation", "gateway-class", resources.GatewayClass.Name)
-					// Notify the main control loop about translation errors. This may be a critical error in standalone mode, so
-					// notify the control loop in case this needs to be handled.
-					r.RunnerErrors.Store(r.Name(), message.NewWatchableError(err))
-				}
-
+			publishIR := func(result *gatewayapi.TranslateResult, translateGCCtx context.Context) {
 				// Publish the IRs.
 				// Also validate the ir before sending it.
 				for key, val := range result.InfraIR {
@@ -421,7 +347,8 @@ func (r *Runner) subscribeAndTranslate(sub <-chan watchable.Snapshot[string, *re
 						xdsIRCount++
 					}
 				}
-
+			}
+			publishStatus := func(result *gatewayapi.TranslateResult, translateGCCtx context.Context) {
 				// Update Status
 				_, statusUpdateSpan := tracer.Start(translateGCCtx, "GatewayApiRunner.ResoureTranslationCycle.UpdateStatus")
 				defer statusUpdateSpan.End()
@@ -544,8 +471,51 @@ func (r *Runner) subscribeAndTranslate(sub <-chan watchable.Snapshot[string, *re
 					}
 				}
 			}
-			for _, resources := range *val {
-				translateGatewayClass(resources)
+
+			// Each worker owns its translator. The coordinator publishes completed IRs
+			// immediately and keeps status aggregation and key cleanup serial.
+			jobs := make(chan int, len(*val))
+			for index := range *val {
+				jobs <- index
+			}
+			close(jobs)
+			completed := make(chan gatewayClassTranslation)
+			var workers sync.WaitGroup
+			for range min(2, len(*val)) {
+				workers.Go(func() {
+					for index := range jobs {
+						translated := r.translateGatewayClass(rtcTraceCtx, (*val)[index])
+						translated.index = index
+						completed <- translated
+					}
+				})
+			}
+			go func() {
+				workers.Wait()
+				close(completed)
+			}()
+			// A publication panic must still join workers before another input is read.
+			defer func() {
+				for range completed {
+				}
+			}()
+			results := make([]gatewayClassTranslation, len(*val))
+			for translated := range completed {
+				if translated.panicValue == nil {
+					publishIR(translated.result, translated.ctx)
+					// Status aggregation does not need to retain the generated IRs.
+					translated.result.XdsIR = nil
+					translated.result.InfraIR = nil
+				}
+				results[translated.index] = translated
+			}
+			// Preserve the original class order when merging shared ancestor statuses.
+			// Failed translations must not trigger mark-and-sweep of their resources.
+			for _, translated := range results {
+				if translated.panicValue != nil {
+					panic(translated.panicValue)
+				}
+				publishStatus(translated.result, translated.ctx)
 			}
 
 			// Store the stauses of all objects atomically with the aggregated status.
@@ -653,6 +623,100 @@ func (r *Runner) subscribeAndTranslate(sub <-chan watchable.Snapshot[string, *re
 		},
 	)
 	r.Logger.Info("shutting down")
+}
+
+type gatewayClassTranslation struct {
+	index      int
+	ctx        context.Context
+	result     *gatewayapi.TranslateResult
+	panicValue any
+}
+
+func (r *Runner) translateGatewayClass(ctx context.Context, resources *resource.Resources) (translated gatewayClassTranslation) {
+	// Forward worker panics to the subscription's recovery handler after all
+	// workers finish. Keep the worker stack, since recovery runs in another goroutine.
+	defer func() {
+		if value := recover(); value != nil {
+			translated.panicValue = fmt.Errorf("%v\n%s", value, debug.Stack())
+		}
+	}()
+	// The GatewayClass name is deliberately kept out of the span name and passed as
+	// an attribute instead: span names are what most trace backends group/aggregate
+	// by (latency percentiles, error rates, etc.), and this loop runs once per
+	// GatewayClass in the cluster. Baking the name into the span name would fragment
+	// those aggregates into one bucket per class - unbounded and growing over the
+	// cluster's lifetime - for no benefit, since the attribute already makes the span
+	// filterable/searchable by GatewayClass in any trace UI.
+	translateGCCtx, translateGCSpan := tracer.Start(ctx, "GatewayApiRunner.ResoureTranslationCycle.TranslateGatewayClass",
+		trace.WithAttributes(attribute.String("gatewayclass.name", resources.GatewayClass.Name)),
+	)
+	defer translateGCSpan.End()
+	traceLogger := r.Logger.WithTrace(translateGCCtx)
+	// Translate this class using worker-local state.
+	t := &gatewayapi.Translator{
+		GatewayControllerName:           r.EnvoyGateway.Gateway.ControllerName,
+		GatewayClassName:                gwapiv1.ObjectName(resources.GatewayClass.Name),
+		GlobalRateLimitEnabled:          r.EnvoyGateway.RateLimit != nil,
+		RateLimitClusterSettings:        r.EnvoyGateway.RateLimit.GetServiceSettings(),
+		EnvoyPatchPolicyEnabled:         r.EnvoyGateway.ExtensionAPIs != nil && r.EnvoyGateway.ExtensionAPIs.EnableEnvoyPatchPolicy,
+		EnvoyProxyPatchDisabled:         !r.EnvoyGateway.RuntimeFlags.IsEnabled(egv1a1.EnvoyProxyPatch),
+		CTPHTTP1ClientScopeOnly:         r.EnvoyGateway.RuntimeFlags.IsEnabled(egv1a1.ApplyClientTrafficPolicyHTTP1SettingsToClientsOnly),
+		OIDCTokenCookieChunkingDisabled: !r.EnvoyGateway.RuntimeFlags.IsEnabled(egv1a1.OIDCTokenCookieChunking),
+		BackendEnabled:                  r.EnvoyGateway.ExtensionAPIs != nil && r.EnvoyGateway.ExtensionAPIs.EnableBackend,
+		ExtensionBackendsEnabled:        r.EnvoyGateway.ExtensionAPIs != nil && r.EnvoyGateway.ExtensionAPIs.EnableExtensionBackends,
+		SDSSecretRefEnabled:             r.EnvoyGateway.ExtensionAPIs != nil && r.EnvoyGateway.ExtensionAPIs.EnableSDSSecretRef,
+		ControllerNamespace:             r.ControllerNamespace,
+		GatewayNamespaceMode:            r.EnvoyGateway.GatewayNamespaceMode(),
+		MergeGateways:                   gatewayapi.IsMergeGatewaysEnabled(resources),
+		MergeBackends:                   gatewayapi.ResolveMergeBackendsConfig(resources),
+		PerResourceSystemCASecret:       r.EnvoyGateway.RuntimeFlags.IsEnabled(egv1a1.PerResourceSystemCASecret),
+		WasmCache:                       r.wasmCache,
+		RunningOnHost:                   r.EnvoyGateway.Provider != nil && r.EnvoyGateway.Provider.IsRunningOnHost(),
+		InfraRemotelyManaged:            r.EnvoyGateway.Provider != nil && r.EnvoyGateway.Provider.IsInfraManagedRemotely(),
+		Logger:                          traceLogger,
+		LuaEnvoyExtensionPolicyDisabled: r.EnvoyGateway.ExtensionAPIs.LuaDisabled(),
+	}
+
+	// If extensions are loaded, pass their supported groups/kinds to the translator
+	if extensions := r.EnvoyGateway.GetExtensionManagers(); len(extensions) > 0 {
+		var extGKs, extSecretGKs []schema.GroupKind
+		for i := range extensions {
+			em := &extensions[i]
+			for _, gvk := range em.Resources {
+				extGKs = append(extGKs, schema.GroupKind{Group: gvk.Group, Kind: gvk.Kind})
+			}
+			// Include backend resources in extension group kinds for custom backend support
+			for _, gvk := range em.BackendResources {
+				extGKs = append(extGKs, schema.GroupKind{Group: gvk.Group, Kind: gvk.Kind})
+			}
+			for _, gvk := range em.SecretResources {
+				extSecretGKs = append(extSecretGKs, schema.GroupKind{Group: gvk.Group, Kind: gvk.Kind})
+			}
+		}
+		t.ExtensionGroupKinds = extGKs
+		t.ExtensionSecretGroupKinds = extSecretGKs
+		traceLogger.Info("extension resources", "GVKs count", len(extGKs))
+	}
+	// Translate to IR.
+	// The span is ended by a deferred call inside the closure: the translator
+	// panics on some inputs and HandleSubscription recovers from it, and an
+	// unended span is never exported, so a plain End() here would drop the
+	// stage span and the input sizes recorded on it. The closure keeps that
+	// defer scoped to this iteration instead of the whole update.
+	result, err := func() (*gatewayapi.TranslateResult, error) {
+		translateToIRCtx, translateToIRSpan := tracer.Start(translateGCCtx, "GatewayApiRunner.ResoureTranslationCycle.TranslateToIR")
+		defer translateToIRSpan.End()
+		return t.Translate(translateToIRCtx, resources)
+	}()
+	if err != nil {
+		// Currently all errors that Translate returns should just be logged
+		traceLogger.Error(err, "errors detected during translation", "gateway-class", resources.GatewayClass.Name)
+		// Notify the main control loop about translation errors. This may be a critical error in standalone mode, so
+		// notify the control loop in case this needs to be handled.
+		r.RunnerErrors.Store(r.Name(), message.NewWatchableError(err))
+	}
+
+	return gatewayClassTranslation{ctx: translateGCCtx, result: result}
 }
 
 func (r *Runner) loadTLSConfig(ctx context.Context) (*tls.Config, []byte, error) {

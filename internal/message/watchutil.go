@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/telepresenceio/watchable"
@@ -131,34 +132,79 @@ func HandleSubscription[K comparable, V any](l logging.Logger,
 	subscription <-chan watchable.Snapshot[K, V],
 	handle func(updateFunc Update[K, V], errChans chan error),
 ) {
+	handleSubscription(l, meta, subscription, 1, handle)
+}
+
+// HandleSubscriptionWithConcurrency runs independent keys in each snapshot concurrently.
+// It finishes the snapshot before reading the next, preserving update and deletion order.
+func HandleSubscriptionWithConcurrency[K comparable, V any](
+	l logging.Logger,
+	meta Metadata,
+	subscription <-chan watchable.Snapshot[K, V],
+	maxConcurrent int,
+	handle func(Update[K, V], chan error),
+) {
+	handleSubscription(l, meta, subscription, maxConcurrent, handle)
+}
+
+func handleSubscription[K comparable, V any](
+	l logging.Logger,
+	meta Metadata,
+	subscription <-chan watchable.Snapshot[K, V],
+	maxConcurrent int,
+	handle func(Update[K, V], chan error),
+) {
 	// TODO: find a suitable value
 	errChans := make(chan error, 10)
+	errorsDone := make(chan struct{})
 	go func() {
+		defer close(errorsDone)
 		for err := range errChans {
 			l.Error(err, "observed an error")
 			watchableSubscribeTotal.WithFailure(metrics.ReasonError, meta.LabelValues()...).Increment()
 		}
 	}()
-	defer close(errChans)
+	defer func() {
+		close(errChans)
+		<-errorsDone
+	}()
+
+	var workers sync.WaitGroup
+	slots := make(chan struct{}, max(1, maxConcurrent))
+	handleUpdate := func(update Update[K, V]) {
+		if maxConcurrent <= 1 {
+			handleWithCrashRecovery(l, handle, update, meta, errChans)
+			return
+		}
+		slots <- struct{}{}
+		workers.Go(func() {
+			defer func() { <-slots }()
+			handleWithCrashRecovery(l, handle, update, meta, errChans)
+		})
+	}
+	// Wait before closing the error channel, including if dispatch itself panics.
+	defer workers.Wait()
 
 	if snapshot, ok := <-subscription; ok {
 		for k, v := range snapshot.State {
 			// Mark initial state so consumers do not report its age as queue latency.
-			handleWithCrashRecovery(l, handle, Update[K, V]{
+			handleUpdate(Update[K, V]{
 				Key:     k,
 				Value:   v,
 				Initial: true,
-			}, meta, errChans)
+			})
 		}
+		workers.Wait()
 	}
 	for snapshot := range subscription {
 		for _, update := range coalesceUpdates(l, snapshot.Updates) {
-			handleWithCrashRecovery(l, handle, Update[K, V]{
+			handleUpdate(Update[K, V]{
 				Key:    update.Key,
 				Value:  update.Value,
 				Delete: update.Delete,
-			}, meta, errChans)
+			})
 		}
+		workers.Wait()
 	}
 }
 

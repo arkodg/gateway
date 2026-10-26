@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -35,6 +36,7 @@ type Manager struct {
 	k8sClient          k8scli.Client
 	namespace          string
 	extension          egv1a1.ExtensionManager
+	extensionConnMu    sync.Mutex
 	extensionConnCache *grpc.ClientConn
 }
 
@@ -204,7 +206,6 @@ func (m *Manager) HasExtension(g gwapiv1.Group, k gwapiv1.Kind) bool {
 // If the extension makes use of the hook then the XDS Hook Client is returned. If it does not support
 // the hook type then nil is returned
 func (m *Manager) GetPreXDSHookClient(xdsHookType egv1a1.XDSTranslatorHook) (extTypes.XDSHookClient, error) {
-	ctx := context.Background()
 	ext := m.extension
 
 	if ext.Hooks == nil {
@@ -225,27 +226,7 @@ func (m *Manager) GetPreXDSHookClient(xdsHookType egv1a1.XDSTranslatorHook) (ext
 		return nil, nil
 	}
 
-	if m.extensionConnCache == nil {
-		serverAddr := grpcExtension.GetExtensionServerAddress(ext.Service)
-
-		opts, err := grpcExtension.GenerateGRPCOptions(ctx, m.k8sClient, ext.Service, ext.MaxMessageSize, serviceName, m.namespace)
-		if err != nil {
-			return nil, err
-		}
-
-		conn, err := grpc.Dial(serverAddr, opts...)
-		if err != nil {
-			return nil, err
-		}
-
-		m.extensionConnCache = conn
-	}
-
-	client := extension.NewEnvoyGatewayExtensionClient(m.extensionConnCache)
-	xdsHookClient := &XDSHook{
-		grpcClient: client,
-	}
-	return xdsHookClient, nil
+	return m.getXDSHookClient()
 }
 
 // GetPostXDSHookClient checks if the registered extension makes use of a particular hook type that modifies
@@ -253,7 +234,6 @@ func (m *Manager) GetPreXDSHookClient(xdsHookType egv1a1.XDSTranslatorHook) (ext
 // If the extension makes use of the hook then the XDS Hook Client is returned. If it does not support
 // the hook type then nil is returned
 func (m *Manager) GetPostXDSHookClient(xdsHookType egv1a1.XDSTranslatorHook) (extTypes.XDSHookClient, error) {
-	ctx := context.Background()
 	ext := m.extension
 
 	if ext.Hooks == nil {
@@ -273,6 +253,15 @@ func (m *Manager) GetPostXDSHookClient(xdsHookType egv1a1.XDSTranslatorHook) (ex
 	if !hookUsed {
 		return nil, nil
 	}
+
+	return m.getXDSHookClient()
+}
+
+func (m *Manager) getXDSHookClient() (extTypes.XDSHookClient, error) {
+	m.extensionConnMu.Lock()
+	defer m.extensionConnMu.Unlock()
+	ctx := context.Background()
+	ext := m.extension
 
 	if m.extensionConnCache == nil {
 		serverAddr := grpcExtension.GetExtensionServerAddress(ext.Service)
@@ -298,6 +287,8 @@ func (m *Manager) GetPostXDSHookClient(xdsHookType egv1a1.XDSTranslatorHook) (ex
 }
 
 func (m *Manager) CleanupHookConns() {
+	m.extensionConnMu.Lock()
+	defer m.extensionConnMu.Unlock()
 	if m.extensionConnCache != nil {
 		m.extensionConnCache.Close()
 	}
